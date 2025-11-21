@@ -23,34 +23,23 @@ class Settings(pydantic_settings.BaseSettings):
     fx_url: pydantic.HttpUrl
 
 
-ENV = Settings()
+ENV = Settings(_env_file=".env")
 ALERT_CHANGE_OVER_TIME = {
     # Tuned to catch meaningful but not extreme moves for GBP→EUR
     datetime.timedelta(hours=1): 0.2,
     datetime.timedelta(hours=6): 0.5,
     datetime.timedelta(days=1): 1.0,
 }
-DATA_FILE = pathlib.Path(__file__).parent / "gbp_last_rates.json"
-LOG_FILE = pathlib.Path(__file__).parent / "gbp_alert.log"
+DATA_FILE = pathlib.Path(__file__).parent / "data" / "gbp_last_rates.json"
+LOG_FILE = pathlib.Path(__file__).parent / "logs" / "gbp_alert.log"
+DATA_FILE.parent.mkdir(exist_ok=True, parents=True)
+LOG_FILE.parent.mkdir(exist_ok=True, parents=True)
 LOG_MAX_BYTES = 1_000_000  # ~1MB per file
 LOG_BACKUPS = 5
 MIN_ALERT_THRESHOLD = 0.1
 VOL_MULTIPLIER = 1.75
 VOL_LOOKBACK = datetime.timedelta(days=30)
 VOL_MIN_POINTS = 6
-logger = logging.getLogger("gbp_alert")
-if not logger.handlers:
-    logger.setLevel(logging.INFO)
-    fmt = logging.Formatter("[%(asctime)s] %(message)s")
-    file_handler = RotatingFileHandler(
-        LOG_FILE, maxBytes=LOG_MAX_BYTES, backupCount=LOG_BACKUPS
-    )
-    file_handler.setFormatter(fmt)
-    stream_handler = logging.StreamHandler()
-    stream_handler.setFormatter(fmt)
-    logger.addHandler(file_handler)
-    logger.addHandler(stream_handler)
-    logger.propagate = False
 # ---------------------------
 
 
@@ -240,4 +229,18 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    logger = logging.getLogger("gbp_alert")
+    if not logger.handlers:
+        logger.setLevel(logging.INFO)
+        fmt = logging.Formatter("[%(asctime)s] %(message)s")
+        file_handler = RotatingFileHandler(
+            LOG_FILE, maxBytes=LOG_MAX_BYTES, backupCount=LOG_BACKUPS
+        )
+        file_handler.setFormatter(fmt)
+        stream_handler = logging.StreamHandler()
+        stream_handler.setFormatter(fmt)
+        logger.addHandler(file_handler)
+        logger.addHandler(stream_handler)
+        logger.propagate = False
+
     main()

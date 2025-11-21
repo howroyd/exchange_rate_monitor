@@ -42,15 +42,17 @@ Notes:
    - For groups, add the bot to the group and send a message first so `getUpdates` shows the group chat ID.
 
 ## Running manually
-```
+```bash
 python gbp_telegram_alert.py
+# or
+./run.sh
 ```
-Creates/updates `gbp_last_rates.json` for history and writes rotating logs to `gbp_alert.log` (1 MB per file, 5 backups).
+Creates/updates `data/gbp_last_rates.json` for history and writes rotating logs to `logs/gbp_alert.log` (1 MB per file, 5 backups).
 
 ## Cron setup
-Recommended: every 10 minutes (good balance for 1h detection and API usage). Example crontab entry:
+Recommended: every 15 minutes (good balance for 1h detection and API usage). Example crontab entry:
 ```
-*/10 * * * * cd /home/myname/exchange_rate_monitor && . .venv/bin/activate && set -a && [ -f .env ] && . .env && set +a && python gbp_telegram_alert.py >> cron.log 2>&1
+*/15 * * * * cd /<PATH_TO_REPO>/exchange_rate_monitor && ./run.sh
 ```
 Adjust the path to your repo and virtualenv as needed.
 
@@ -60,10 +62,10 @@ Adjust the path to your repo and virtualenv as needed.
 - Alerts send via Telegram Markdown with up/down direction and the latest rate.
 
 ## Logs and data
-- Alerts and status logs: `gbp_alert.log` (rotates, keeps 5 backups).
-- Raw script output (from cron): `cron.log` (not rotated by the script; rotate via logrotate/cron if desired). Example logrotate entry (`/etc/logrotate.d/exchange_rate_monitor`) for daily rotation with compression:
+- Alerts and status logs: `logs/gbp_alert.log` (rotates, keeps 5 backups).
+- Raw script output (from cron): `logs/cron.log` (not rotated by the script; rotate via logrotate/cron if desired). Example logrotate entry (`/etc/logrotate.d/exchange_rate_monitor`) for daily rotation with compression:
   ```
-  /home/myname/exchange_rate_monitor/cron.log {
+  /<PATH_TO_REPO>/exchange_rate_monitor/logs/cron.log {
       daily
       rotate 7
       compress
@@ -73,4 +75,4 @@ Adjust the path to your repo and virtualenv as needed.
       copytruncate
   }
   ```
-- Stored rates: `gbp_last_rates.json` (keeps only the needed lookback window).
+- Stored rates: `data/gbp_last_rates.json` (keeps only the needed lookback window).
