@@ -190,30 +190,30 @@ def main() -> None:
     """Fetch, evaluate, and alert on GBP→EUR moves."""
     try:
         new_rate = get_current_rate(ENV.fx_url)
-        logger.info("Fetched new rate: %s from %s", new_rate.rate, new_rate.source)
+        logging.info("Fetched new rate: %s from %s", new_rate.rate, new_rate.source)
     except (
         requests.RequestException,
         ValueError,
         KeyError,
         pydantic.ValidationError,
     ) as err:
-        logger.error("ERROR fetching rate: %s", err)
+        logging.error("ERROR fetching rate: %s", err)
         return
 
     last_rates = load_last_rates(DATA_FILE)
 
     hourly_vol = calculate_hourly_volatility(last_rates)
     if hourly_vol is None:
-        logger.info("Rolling volatility unavailable; using static thresholds.")
+        logging.warning("Rolling volatility unavailable; using static thresholds.")
     else:
-        logger.info("Hourly vol estimate: %.4f%% (per sqrt hour)", hourly_vol)
+        logging.info("Hourly vol estimate: %.4f%% (per sqrt hour)", hourly_vol)
 
     diff_percents = calculate_delta_percents(new_rate, last_rates)
 
     for delta, percent in diff_percents.items():
         threshold = threshold_for_delta(delta, hourly_vol)
         if abs(percent) >= threshold:
-            logger.info(
+            logging.info(
                 "ALERT condition met for %s: %.3f%% change (threshold: %.3f%%)",
                 delta,
                 percent,
@@ -221,26 +221,25 @@ def main() -> None:
             )
             message = Message(new_rate=new_rate.rate, movement=percent)
             send_telegram_message(message, ENV.bot_token, ENV.chat_id)
-            logger.info("Alert sent to Telegram.")
+            logging.info("Alert sent to Telegram.")
 
     last_rates.append(new_rate)
     last_rates = clean_rates(last_rates)
     save_rates(DATA_FILE, last_rates)
 
 
-if __name__ == "__main__":
-    logger = logging.getLogger("gbp_alert")
-    if not logger.handlers:
-        logger.setLevel(logging.INFO)
-        fmt = logging.Formatter("[%(asctime)s] %(message)s")
-        file_handler = RotatingFileHandler(
-            LOG_FILE, maxBytes=LOG_MAX_BYTES, backupCount=LOG_BACKUPS
-        )
-        file_handler.setFormatter(fmt)
-        stream_handler = logging.StreamHandler()
-        stream_handler.setFormatter(fmt)
-        logger.addHandler(file_handler)
-        logger.addHandler(stream_handler)
-        logger.propagate = False
+def setup_logging():
+    """Set up logging with rotating file handler and console output."""
+    formatter = logging.Formatter("[%(asctime)s] %(message)s")
+    file_handler = RotatingFileHandler(
+        LOG_FILE, maxBytes=LOG_MAX_BYTES, backupCount=LOG_BACKUPS
+    )
+    file_handler.setFormatter(formatter)
+    stream_handler = logging.StreamHandler()
+    stream_handler.setFormatter(formatter)
+    logging.basicConfig(level=logging.INFO, handlers=[file_handler, stream_handler])
 
+
+if __name__ == "__main__":
+    setup_logging()
     main()
