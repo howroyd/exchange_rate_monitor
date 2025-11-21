@@ -112,8 +112,9 @@ def load_last_rates(fn: pathlib.Path) -> list[Datafile]:
 
 def clean_rates(rates: list[Datafile]) -> list[Datafile]:
     """Drop samples older than the longest configured lookback."""
-    oldest_delta_to_keep = max(max(ALERT_CHANGE_OVER_TIME.keys()), VOL_LOOKBACK)
-    return [r for r in rates if r.ts >= datetime.datetime.now() - oldest_delta_to_keep]
+    oldest_delta_to_keep = max(*ALERT_CHANGE_OVER_TIME, VOL_LOOKBACK)
+    cutoff = datetime.datetime.now() - oldest_delta_to_keep
+    return [r for r in rates if r.ts >= cutoff]
 
 
 def save_rates(fn: pathlib.Path, rates: list[Datafile]):
@@ -132,7 +133,7 @@ def calculate_delta_percents(
         return {}
     deltas = {}
     now = datetime.datetime.now()
-    for delta in ALERT_CHANGE_OVER_TIME.keys():
+    for delta in ALERT_CHANGE_OVER_TIME:
         cutoff = now - delta
         relevant_rates = [r for r in last_rates if r.ts >= cutoff]
         if relevant_rates:
@@ -183,10 +184,14 @@ def threshold_for_delta(
     return max(vol_component, MIN_ALERT_THRESHOLD, static_threshold)
 
 
-def send_telegram_message(msg: Message) -> dict[str, Any]:
+def send_telegram_message(msg: Message, bot_token: str, chat_id: int) -> dict[str, Any]:
     """Send a Telegram message using the bot token and chat ID."""
-    url = f"https://api.telegram.org/bot{ENV.bot_token}/sendMessage"
-    payload = {"chat_id": ENV.chat_id, "text": str(msg), "parse_mode": "Markdown"}
+    url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+    payload = {
+        "chat_id": str(chat_id),
+        "text": str(msg),
+        "parse_mode": "Markdown",
+    }
     r = requests.post(url, json=payload, timeout=10)
     r.raise_for_status()
     return r.json()
@@ -196,9 +201,14 @@ def main() -> None:
     """Fetch, evaluate, and alert on GBP→EUR moves."""
     try:
         new_rate = get_current_rate(ENV.fx_url)
-        logger.info(f"Fetched new rate: {new_rate.rate} from {new_rate.source}")
-    except Exception as e:
-        logger.error(f"ERROR fetching rate: {e}")
+        logger.info("Fetched new rate: %s from %s", new_rate.rate, new_rate.source)
+    except (
+        requests.RequestException,
+        ValueError,
+        KeyError,
+        pydantic.ValidationError,
+    ) as err:
+        logger.error("ERROR fetching rate: %s", err)
         return
 
     last_rates = load_last_rates(DATA_FILE)
@@ -207,7 +217,7 @@ def main() -> None:
     if hourly_vol is None:
         logger.info("Rolling volatility unavailable; using static thresholds.")
     else:
-        logger.info(f"Hourly vol estimate: {hourly_vol:.4f}% (per sqrt hour)")
+        logger.info("Hourly vol estimate: %.4f%% (per sqrt hour)", hourly_vol)
 
     diff_percents = calculate_delta_percents(new_rate, last_rates)
 
@@ -215,10 +225,13 @@ def main() -> None:
         threshold = threshold_for_delta(delta, hourly_vol)
         if abs(percent) >= threshold:
             logger.info(
-                f"ALERT condition met for {delta}: {percent:.3f}% change (threshold: {threshold:.3f}%)"
+                "ALERT condition met for %s: %.3f%% change (threshold: %.3f%%)",
+                delta,
+                percent,
+                threshold,
             )
             message = Message(new_rate=new_rate.rate, movement=percent)
-            send_telegram_message(message)
+            send_telegram_message(message, ENV.bot_token, ENV.chat_id)
             logger.info("Alert sent to Telegram.")
 
     last_rates.append(new_rate)
