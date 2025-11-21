@@ -1,4 +1,6 @@
 #!.venv/bin python3
+"""GBP→EUR alerts with static and volatility-aware thresholds."""
+
 import datetime
 import json
 import logging
@@ -6,16 +8,16 @@ import math
 import pathlib
 import statistics
 from logging.handlers import RotatingFileHandler
+from typing import Any
 
 import pydantic
 import pydantic_settings
 import requests
 
 
-# ---------------------------
-# CONFIG
-# ------------- --------------
 class Settings(pydantic_settings.BaseSettings):
+    """Environment configuration for Telegram and FX source."""
+
     bot_token: str
     chat_id: int
     fx_url: pydantic.HttpUrl
@@ -52,10 +54,9 @@ if not logger.handlers:
 # ---------------------------
 
 
-# ---------------------------
-# DATAFILE STRUCTURE
-# ------------- --------------
 class Datafile(pydantic.BaseModel):
+    """Stored exchange rate sample."""
+
     rate: float
     source: pydantic.HttpUrl
     ts: datetime.datetime = pydantic.Field(default_factory=datetime.datetime.now)
@@ -64,10 +65,9 @@ class Datafile(pydantic.BaseModel):
 # ---------------------------
 
 
-# ---------------------------
-# TELEGRAM STRUCTURE
-# ------------- --------------
 class Message(pydantic.BaseModel):
+    """Telegram message content for alerts."""
+
     new_rate: float
     movement: float = pydantic.Field(
         default_factory=lambda data: data["new_rate"] - data["old_rate"]
@@ -89,6 +89,7 @@ class Message(pydantic.BaseModel):
 
 
 def get_current_rate(url: pydantic.HttpUrl) -> Datafile:
+    """Fetch the current GBP→EUR rate from the given API URL."""
     r = requests.get(url, timeout=10)
     r.raise_for_status()
     data = r.json()
@@ -96,6 +97,7 @@ def get_current_rate(url: pydantic.HttpUrl) -> Datafile:
 
 
 def load_last_rates(fn: pathlib.Path) -> list[Datafile]:
+    """Load stored rates from disk, sorted by timestamp."""
     if not fn.exists():
         return []
     as_json = json.loads(fn.read_text())
@@ -109,11 +111,13 @@ def load_last_rates(fn: pathlib.Path) -> list[Datafile]:
 
 
 def clean_rates(rates: list[Datafile]) -> list[Datafile]:
+    """Drop samples older than the longest configured lookback."""
     oldest_delta_to_keep = max(max(ALERT_CHANGE_OVER_TIME.keys()), VOL_LOOKBACK)
     return [r for r in rates if r.ts >= datetime.datetime.now() - oldest_delta_to_keep]
 
 
 def save_rates(fn: pathlib.Path, rates: list[Datafile]):
+    """Persist rate samples to disk as JSON."""
     as_dict = {
         r.ts.isoformat(): json.loads(r.model_dump_json(exclude={"ts"})) for r in rates
     }
@@ -123,6 +127,7 @@ def save_rates(fn: pathlib.Path, rates: list[Datafile]):
 def calculate_delta_percents(
     new_rate: Datafile, last_rates: list[Datafile]
 ) -> dict[datetime.timedelta, float]:
+    """Compute percent changes versus the oldest rate within each window."""
     if not last_rates:
         return {}
     deltas = {}
@@ -140,6 +145,7 @@ def calculate_delta_percents(
 
 
 def calculate_hourly_volatility(last_rates: list[Datafile]) -> float | None:
+    """Estimate hourly volatility (percent per sqrt hour) from stored samples."""
     cutoff = datetime.datetime.now() - VOL_LOOKBACK
     window = [r for r in sorted(last_rates, key=lambda r: r.ts) if r.ts >= cutoff]
     if len(window) < VOL_MIN_POINTS:
@@ -167,6 +173,7 @@ def calculate_hourly_volatility(last_rates: list[Datafile]) -> float | None:
 def threshold_for_delta(
     delta: datetime.timedelta, sigma_per_hour: float | None
 ) -> float:
+    """Return threshold for a window based on static levels and rolling vol."""
     static_threshold = ALERT_CHANGE_OVER_TIME[delta]
     if sigma_per_hour is None:
         return static_threshold
@@ -176,7 +183,8 @@ def threshold_for_delta(
     return max(vol_component, MIN_ALERT_THRESHOLD, static_threshold)
 
 
-def send_telegram_message(msg: Message):
+def send_telegram_message(msg: Message) -> dict[str, Any]:
+    """Send a Telegram message using the bot token and chat ID."""
     url = f"https://api.telegram.org/bot{ENV.bot_token}/sendMessage"
     payload = {"chat_id": ENV.chat_id, "text": str(msg), "parse_mode": "Markdown"}
     r = requests.post(url, json=payload, timeout=10)
@@ -184,7 +192,8 @@ def send_telegram_message(msg: Message):
     return r.json()
 
 
-def main():
+def main() -> None:
+    """Fetch, evaluate, and alert on GBP→EUR moves."""
     try:
         new_rate = get_current_rate(ENV.fx_url)
         logger.info(f"Fetched new rate: {new_rate.rate} from {new_rate.source}")
