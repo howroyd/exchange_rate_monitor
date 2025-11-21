@@ -3,8 +3,8 @@
 Simple cron-friendly script that watches the GBP→EUR rate, stores recent history, and sends a Telegram alert when the move exceeds a static or volatility-adjusted threshold.
 
 ## Requirements
-- Python 3.14+ recommended however it may work in earlier versions (not tested)
-- `pip install pydantic pydantic-settings requests`
+- Python 3.14 used/tested; should work on 3.11+ as well
+- Install dependencies: `pip install -r requirements.txt`
 - A Telegram bot token and the chat ID to send alerts to
 
 ## Configuration (.env)
