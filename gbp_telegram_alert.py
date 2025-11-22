@@ -14,6 +14,8 @@ import pydantic
 import pydantic_settings
 import requests
 import tinydb
+from tinydb import where
+from tinydb.table import Table
 
 
 class Settings(pydantic_settings.BaseSettings):
@@ -25,14 +27,21 @@ class Settings(pydantic_settings.BaseSettings):
 
 
 ENV = Settings(_env_file=".env")
-EPOCH = datetime.datetime(1970, 1, 1, 0, 0, 0, tzinfo=datetime.UTC)
 ALERT_CHANGE_OVER_TIME = {
     # Tuned to catch meaningful but not extreme moves for GBP→EUR
     datetime.timedelta(hours=1): 0.2,
     datetime.timedelta(hours=6): 0.5,
     datetime.timedelta(days=1): 1.0,
+    datetime.timedelta(days=7): 2.5,
+    datetime.timedelta(days=14): 3.5,
+    datetime.timedelta(days=30): 5.0,
 }
+TABLE_NAMES = {
+    period: str(int(period.total_seconds())) for period in ALERT_CHANGE_OVER_TIME
+}
+TABLE_PERIODS = {name: period for period, name in TABLE_NAMES.items()}
 DATA_FILE = pathlib.Path(__file__).parent / "data" / "gbp_last_rates.json"
+DB_FILE = DATA_FILE.parent / "gbp_alert_db.json"
 LOG_FILE = pathlib.Path(__file__).parent / "logs" / "gbp_alert.log"
 DATA_FILE.parent.mkdir(exist_ok=True, parents=True)
 LOG_FILE.parent.mkdir(exist_ok=True, parents=True)
@@ -69,7 +78,9 @@ class AlertMessage(pydantic.BaseModel):
             period = _period_from_table_name(table_name)
             if period is None or period not in ALERT_CHANGE_OVER_TIME:
                 continue
-            delta_percent = next(iter(hits.values()))
+            delta_percent = hits.get("static", hits.get("dynamic"))
+            if delta_percent is None:
+                continue
             static_threshold, dynamic_threshold = _thresholds_for_period(
                 period, self.volatilities.get(table_name)
             )
@@ -91,9 +102,9 @@ class AlertMessage(pydantic.BaseModel):
 
 def get_current_rate(url: pydantic.HttpUrl) -> Datafile:
     """Fetch the current GBP→EUR rate from the given API URL."""
-    r = requests.get(url, timeout=10)
-    r.raise_for_status()
-    data = r.json()
+    response = requests.get(url, timeout=10)
+    response.raise_for_status()
+    data = response.json()
     return Datafile(rate=float(data["rates"]["EUR"]), source=url)
 
 
@@ -116,11 +127,12 @@ def _sigma_per_hour(samples: list[tuple[datetime.datetime, float]]) -> float | N
 
 def _period_from_table_name(table_name: str) -> datetime.timedelta | None:
     """Derive the timedelta represented by the TinyDB table name."""
-    try:
-        seconds = int(float(table_name))
-    except ValueError:
-        return None
-    return datetime.timedelta(seconds=seconds)
+    return TABLE_PERIODS.get(table_name)
+
+
+def _table_name_for_period(period: datetime.timedelta) -> str:
+    """Return the TinyDB table name for a timedelta."""
+    return TABLE_NAMES.get(period, str(int(period.total_seconds())))
 
 
 def _format_period(period: datetime.timedelta) -> str:
@@ -138,7 +150,7 @@ def _format_period(period: datetime.timedelta) -> str:
     return f"{total_seconds}s"
 
 
-def _sorted_samples(table: tinydb.Table) -> list[tuple[datetime.datetime, float]]:
+def _sorted_samples(table: Table) -> list[tuple[datetime.datetime, float]]:
     """Return table rows as sorted (timestamp, rate) tuples."""
     return sorted(
         (
@@ -166,9 +178,9 @@ def _thresholds_for_period(
 
 def filter_tables_over_thresholds(
     deltas: dict[str, float | None], volatilities: dict[str, float | None]
-) -> dict[str, dict[str, float | None]]:
+) -> dict[str, dict[str, float]]:
     """Return tables whose percent change exceeds static and/or dynamic thresholds."""
-    breaches: dict[str, dict[str, float | None]] = {}
+    breaches: dict[str, dict[str, float]] = {}
     for table_name, delta_percent in deltas.items():
         if delta_percent is None:
             continue
@@ -180,7 +192,7 @@ def filter_tables_over_thresholds(
             period, sigma_per_hour
         )
 
-        hits: dict[str, float | None] = {}
+        hits: dict[str, float] = {}
         if abs(delta_percent) >= static_threshold:
             hits["static"] = delta_percent
         if dynamic_threshold is not None and abs(delta_percent) >= dynamic_threshold:
@@ -200,13 +212,13 @@ def send_telegram_message(text: str, bot_token: str, chat_id: int) -> dict[str, 
         "text": text,
         "parse_mode": "Markdown",
     }
-    r = requests.post(url, json=payload, timeout=10)
-    r.raise_for_status()
-    return r.json()
+    response = requests.post(url, json=payload, timeout=10)
+    response.raise_for_status()
+    return response.json()
 
 
 def trim_table(
-    table: tinydb.Table, period: datetime.timedelta, *, reset_item_ids: bool = False
+    table: Table, period: datetime.timedelta, *, reset_item_ids: bool = False
 ):
     """Remove entries older than the specified period from the TinyDB table."""
     cutoff = datetime.datetime.now(datetime.UTC) - period
@@ -215,7 +227,7 @@ def trim_table(
         ts_str = entry["ts"]
         ts = datetime.datetime.fromisoformat(ts_str).replace(tzinfo=datetime.UTC)
         if ts < cutoff:
-            table.remove(tinydb.where("ts") == ts_str)
+            table.remove(where("ts") == ts_str)
             logging.info(f"Removed old entry {ts_str} from {period} table.")
 
     if reset_item_ids:
@@ -223,8 +235,8 @@ def trim_table(
         table.truncate()
         for entry in sorted(all_entries, key=lambda e: e["ts"]):
             table.insert(dict(entry.items()))
-        table_name = str(round(period.total_seconds()))
-        logging.info(f"Reset item IDs in {table_name} table.")
+        table_name = _table_name_for_period(period)
+        logging.info("Reset item IDs in %s table.", table_name)
 
 
 def put_new_rate_into_db(
@@ -233,8 +245,8 @@ def put_new_rate_into_db(
     """Persist the new rate into each period table if enough time has passed."""
     tables_updated = []
 
-    for period, change in ALERT_CHANGE_OVER_TIME.items():
-        table_name = str(round(period.total_seconds()))
+    for period in ALERT_CHANGE_OVER_TIME:
+        table_name = _table_name_for_period(period)
         table = db.table(table_name)
         trim_table(table, period)
 
@@ -261,12 +273,10 @@ def calculate_volatilities_per_period(
     db: tinydb.TinyDB, table_names: list[str]
 ) -> dict[str, float | None]:
     """Calculate volatilities for each period table provided."""
-    volatilities = {}
-    for table_name in table_names:
-        table = db.table(table_name)
-        samples = _sorted_samples(table)
-        volatilities[table_name] = _sigma_per_hour(samples)
-    return volatilities
+    return {
+        table_name: _sigma_per_hour(_sorted_samples(db.table(table_name)))
+        for table_name in table_names
+    }
 
 
 def calculate_delta_percents(
@@ -275,8 +285,7 @@ def calculate_delta_percents(
     """Compute percent change between oldest and newest entries per period table."""
     deltas: dict[str, float | None] = {}
     for table_name in table_names:
-        table = db.table(table_name)
-        samples = _sorted_samples(table)
+        samples = _sorted_samples(db.table(table_name))
         if len(samples) < 2:
             deltas[table_name] = None
             continue
@@ -288,12 +297,10 @@ def calculate_delta_percents(
 
 def main() -> None:
     """Fetch, evaluate, and alert on GBP→EUR moves."""
-    with tinydb.TinyDB(DATA_FILE.parent / "gbp_alert_db.json") as db:
+    with tinydb.TinyDB(DB_FILE) as db:
         new_rate = get_current_rate(ENV.fx_url)
         logging.info("Fetched new rate: %s from %s", new_rate.rate, new_rate.source)
-        tables_updated = put_new_rate_into_db(
-            db, new_rate, force=True
-        )  # Set force=True for testing
+        tables_updated = put_new_rate_into_db(db, new_rate)
         if not tables_updated:
             logging.info("No new entries added to any period table; exiting.")
             return
