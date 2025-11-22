@@ -228,7 +228,7 @@ def trim_table(
         ts = datetime.datetime.fromisoformat(ts_str).replace(tzinfo=datetime.UTC)
         if ts < cutoff:
             table.remove(where("ts") == ts_str)
-            logging.info(f"Removed old entry {ts_str} from {period} table.")
+            logging.info("Removed old entry %s from %s table.", ts_str, period)
 
     if reset_item_ids:
         all_entries = table.all()
@@ -263,7 +263,7 @@ def put_new_rate_into_db(
 
         data = new_rate.model_dump(mode="json")
         _item_id = table.insert(data)
-        trim_table(table, period, reset_item_ids=True if _item_id > 1000 else False)
+        trim_table(table, period, reset_item_ids=_item_id > 1000)
         tables_updated.append(table_name)
 
     return tables_updated
