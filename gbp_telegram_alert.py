@@ -2,7 +2,7 @@
 """GBP→EUR alerts with static and volatility-aware thresholds."""
 
 import datetime
-import json
+import itertools
 import logging
 import math
 import pathlib
@@ -13,6 +13,7 @@ from typing import Any
 import pydantic
 import pydantic_settings
 import requests
+import tinydb
 
 
 class Settings(pydantic_settings.BaseSettings):
@@ -24,6 +25,7 @@ class Settings(pydantic_settings.BaseSettings):
 
 
 ENV = Settings(_env_file=".env")
+EPOCH = datetime.datetime(1970, 1, 1, 0, 0, 0, tzinfo=datetime.UTC)
 ALERT_CHANGE_OVER_TIME = {
     # Tuned to catch meaningful but not extreme moves for GBP→EUR
     datetime.timedelta(hours=1): 0.2,
@@ -38,7 +40,6 @@ LOG_MAX_BYTES = 1_000_000  # ~1MB per file
 LOG_BACKUPS = 5
 MIN_ALERT_THRESHOLD = 0.1
 VOL_MULTIPLIER = 1.75
-VOL_LOOKBACK = datetime.timedelta(days=30)
 VOL_MIN_POINTS = 6
 # ---------------------------
 
@@ -48,30 +49,41 @@ class Datafile(pydantic.BaseModel):
 
     rate: float
     source: pydantic.HttpUrl
-    ts: datetime.datetime = pydantic.Field(default_factory=datetime.datetime.now)
+    ts: datetime.datetime = pydantic.Field(
+        default_factory=lambda: datetime.datetime.now(tz=datetime.UTC)
+    )
 
 
 # ---------------------------
 
 
-class Message(pydantic.BaseModel):
-    """Telegram message content for alerts."""
+class AlertMessage(pydantic.BaseModel):
+    """Telegram message content summarizing threshold breaches."""
 
-    new_rate: float
-    movement: float = pydantic.Field(
-        default_factory=lambda data: data["new_rate"] - data["old_rate"]
-    )
-    direction: str = pydantic.Field(
-        default_factory=lambda data: "up 📈" if data["movement"] > 0 else "down 📉"
-    )
+    breaches: dict[str, dict[str, float]]
+    volatilities: dict[str, float | None]
 
-    def __str__(self):
-        return (
-            f"*GBP→EUR ALERT*\n\n"
-            f"Movement: *{self.movement:.2f}* {self.direction}\n"
-            f"New rate: `{self.new_rate:.6f}`\n\n"
-            f"Check Wise if you want to act."
-        )
+    def __str__(self) -> str:
+        lines: list[str] = ["*GBP→EUR ALERTS*", ""]
+        for table_name, hits in sorted(self.breaches.items()):
+            period = _period_from_table_name(table_name)
+            if period is None or period not in ALERT_CHANGE_OVER_TIME:
+                continue
+            delta_percent = next(iter(hits.values()))
+            static_threshold, dynamic_threshold = _thresholds_for_period(
+                period, self.volatilities.get(table_name)
+            )
+            triggered = []
+            if "static" in hits:
+                triggered.append(f"static ≥ {static_threshold:.2f}%")
+            if "dynamic" in hits and dynamic_threshold is not None:
+                triggered.append(f"dynamic ≥ {dynamic_threshold:.2f}%")
+            period_label = _format_period(period)
+            lines.append(
+                f"- {period_label}: Δ {delta_percent:+.2f}% ({'; '.join(triggered)})"
+            )
+
+        return "\n".join(lines)
 
 
 # ---------------------------
@@ -85,100 +97,107 @@ def get_current_rate(url: pydantic.HttpUrl) -> Datafile:
     return Datafile(rate=float(data["rates"]["EUR"]), source=url)
 
 
-def load_last_rates(fn: pathlib.Path) -> list[Datafile]:
-    """Load stored rates from disk, sorted by timestamp."""
-    if not fn.exists():
-        return []
-    as_json = json.loads(fn.read_text())
+def _sigma_per_hour(samples: list[tuple[datetime.datetime, float]]) -> float | None:
+    """Return volatility (percent per sqrt hour) from timestamp/rate samples."""
+    if len(samples) < VOL_MIN_POINTS:
+        return None
+
+    terms = []
+    for (tsa, ra), (tsb, rb) in itertools.pairwise(samples):
+        delta_hours = (tsb - tsa).total_seconds() / 3600
+        if delta_hours > 0:
+            terms.append((math.log(rb / ra) ** 2) / delta_hours)
+
+    if len(terms) < max(3, VOL_MIN_POINTS - 1):
+        return None
+
+    return math.sqrt(statistics.fmean(terms)) * 100
+
+
+def _period_from_table_name(table_name: str) -> datetime.timedelta | None:
+    """Derive the timedelta represented by the TinyDB table name."""
+    try:
+        seconds = int(float(table_name))
+    except ValueError:
+        return None
+    return datetime.timedelta(seconds=seconds)
+
+
+def _format_period(period: datetime.timedelta) -> str:
+    """Return a short label for a timedelta (e.g., 1h, 6h, 1d)."""
+    total_seconds = int(period.total_seconds())
+    if total_seconds % 86400 == 0:
+        days = total_seconds // 86400
+        return f"{days}d"
+    if total_seconds % 3600 == 0:
+        hours = total_seconds // 3600
+        return f"{hours}h"
+    if total_seconds % 60 == 0:
+        minutes = total_seconds // 60
+        return f"{minutes}m"
+    return f"{total_seconds}s"
+
+
+def _sorted_samples(table: tinydb.Table) -> list[tuple[datetime.datetime, float]]:
+    """Return table rows as sorted (timestamp, rate) tuples."""
     return sorted(
-        [
-            Datafile(**data_dict, ts=datetime.datetime.fromisoformat(ts))
-            for ts, data_dict in as_json.items()
-        ],
-        key=lambda r: r.ts,
+        (
+            datetime.datetime.fromisoformat(entry["ts"]).replace(tzinfo=datetime.UTC),
+            float(entry["rate"]),
+        )
+        for entry in table.all()
     )
 
 
-def clean_rates(rates: list[Datafile]) -> list[Datafile]:
-    """Drop samples older than the longest configured lookback."""
-    oldest_delta_to_keep = max(*ALERT_CHANGE_OVER_TIME, VOL_LOOKBACK)
-    cutoff = datetime.datetime.now() - oldest_delta_to_keep
-    return [r for r in rates if r.ts >= cutoff]
-
-
-def save_rates(fn: pathlib.Path, rates: list[Datafile]):
-    """Persist rate samples to disk as JSON."""
-    as_dict = {
-        r.ts.isoformat(): json.loads(r.model_dump_json(exclude={"ts"})) for r in rates
-    }
-    fn.write_text(json.dumps(as_dict, indent=2))
-
-
-def calculate_delta_percents(
-    new_rate: Datafile, last_rates: list[Datafile]
-) -> dict[datetime.timedelta, float]:
-    """Compute percent changes versus the oldest rate within each window."""
-    if not last_rates:
-        return {}
-    deltas = {}
-    now = datetime.datetime.now()
-    for delta in ALERT_CHANGE_OVER_TIME:
-        cutoff = now - delta
-        relevant_rates = [r for r in last_rates if r.ts >= cutoff]
-        if relevant_rates:
-            oldest_rate = relevant_rates[0]
-            percent_change = (
-                (new_rate.rate - oldest_rate.rate) / oldest_rate.rate
-            ) * 100
-            deltas[delta] = percent_change
-    return deltas
-
-
-def calculate_hourly_volatility(last_rates: list[Datafile]) -> float | None:
-    """Estimate hourly volatility (percent per sqrt hour) from stored samples."""
-    cutoff = datetime.datetime.now() - VOL_LOOKBACK
-    window = [r for r in sorted(last_rates, key=lambda r: r.ts) if r.ts >= cutoff]
-    if len(window) < VOL_MIN_POINTS:
-        return None
-
-    variance_terms = []
-    prev = window[0]
-    for rate in window[1:]:
-        delta_hours = (rate.ts - prev.ts).total_seconds() / 3600
-        if delta_hours <= 0:
-            prev = rate
-            continue
-        log_return = math.log(rate.rate / prev.rate)
-        variance_terms.append((log_return**2) / delta_hours)
-        prev = rate
-
-    if len(variance_terms) < max(3, VOL_MIN_POINTS - 1):
-        return None
-
-    # Convert to percent per sqrt-hour
-    sigma_per_hour = math.sqrt(statistics.fmean(variance_terms)) * 100
-    return sigma_per_hour
-
-
-def threshold_for_delta(
-    delta: datetime.timedelta, sigma_per_hour: float | None
-) -> float:
-    """Return threshold for a window based on static levels and rolling vol."""
-    static_threshold = ALERT_CHANGE_OVER_TIME[delta]
+def _thresholds_for_period(
+    period: datetime.timedelta, sigma_per_hour: float | None
+) -> tuple[float, float | None]:
+    """Return static and dynamic thresholds for a period."""
+    static_threshold = max(MIN_ALERT_THRESHOLD, ALERT_CHANGE_OVER_TIME[period])
     if sigma_per_hour is None:
-        return static_threshold
+        return static_threshold, None
 
-    delta_hours = delta.total_seconds() / 3600
-    vol_component = sigma_per_hour * math.sqrt(delta_hours) * VOL_MULTIPLIER
-    return max(vol_component, MIN_ALERT_THRESHOLD, static_threshold)
+    delta_hours = period.total_seconds() / 3600
+    dynamic_threshold = max(
+        MIN_ALERT_THRESHOLD, sigma_per_hour * math.sqrt(delta_hours) * VOL_MULTIPLIER
+    )
+    return static_threshold, dynamic_threshold
 
 
-def send_telegram_message(msg: Message, bot_token: str, chat_id: int) -> dict[str, Any]:
+def filter_tables_over_thresholds(
+    deltas: dict[str, float | None], volatilities: dict[str, float | None]
+) -> dict[str, dict[str, float | None]]:
+    """Return tables whose percent change exceeds static and/or dynamic thresholds."""
+    breaches: dict[str, dict[str, float | None]] = {}
+    for table_name, delta_percent in deltas.items():
+        if delta_percent is None:
+            continue
+        period = _period_from_table_name(table_name)
+        if period is None or period not in ALERT_CHANGE_OVER_TIME:
+            continue
+        sigma_per_hour = volatilities.get(table_name)
+        static_threshold, dynamic_threshold = _thresholds_for_period(
+            period, sigma_per_hour
+        )
+
+        hits: dict[str, float | None] = {}
+        if abs(delta_percent) >= static_threshold:
+            hits["static"] = delta_percent
+        if dynamic_threshold is not None and abs(delta_percent) >= dynamic_threshold:
+            hits["dynamic"] = delta_percent
+
+        if hits:
+            breaches[table_name] = hits
+
+    return breaches
+
+
+def send_telegram_message(text: str, bot_token: str, chat_id: int) -> dict[str, Any]:
     """Send a Telegram message using the bot token and chat ID."""
     url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
     payload = {
         "chat_id": str(chat_id),
-        "text": str(msg),
+        "text": text,
         "parse_mode": "Markdown",
     }
     r = requests.post(url, json=payload, timeout=10)
@@ -186,46 +205,108 @@ def send_telegram_message(msg: Message, bot_token: str, chat_id: int) -> dict[st
     return r.json()
 
 
+def trim_table(
+    table: tinydb.Table, period: datetime.timedelta, *, reset_item_ids: bool = False
+):
+    """Remove entries older than the specified period from the TinyDB table."""
+    cutoff = datetime.datetime.now(datetime.UTC) - period
+
+    for entry in table.all():
+        ts_str = entry["ts"]
+        ts = datetime.datetime.fromisoformat(ts_str).replace(tzinfo=datetime.UTC)
+        if ts < cutoff:
+            table.remove(tinydb.where("ts") == ts_str)
+            logging.info(f"Removed old entry {ts_str} from {period} table.")
+
+    if reset_item_ids:
+        all_entries = table.all()
+        table.truncate()
+        for entry in sorted(all_entries, key=lambda e: e["ts"]):
+            table.insert(dict(entry.items()))
+        table_name = str(round(period.total_seconds()))
+        logging.info(f"Reset item IDs in {table_name} table.")
+
+
+def put_new_rate_into_db(
+    db: tinydb.TinyDB, new_rate: Datafile, *, force: bool = False
+) -> list[str]:
+    """Persist the new rate into each period table if enough time has passed."""
+    tables_updated = []
+
+    for period, change in ALERT_CHANGE_OVER_TIME.items():
+        table_name = str(round(period.total_seconds()))
+        table = db.table(table_name)
+        trim_table(table, period)
+
+        entries = table.all()
+        if entries and not force:
+            last_ts = max(
+                datetime.datetime.fromisoformat(entry["ts"]).replace(
+                    tzinfo=datetime.UTC
+                )
+                for entry in entries
+            )
+            if (new_rate.ts - last_ts) < period:
+                continue
+
+        data = new_rate.model_dump(mode="json")
+        _item_id = table.insert(data)
+        trim_table(table, period, reset_item_ids=True if _item_id > 1000 else False)
+        tables_updated.append(table_name)
+
+    return tables_updated
+
+
+def calculate_volatilities_per_period(
+    db: tinydb.TinyDB, table_names: list[str]
+) -> dict[str, float | None]:
+    """Calculate volatilities for each period table provided."""
+    volatilities = {}
+    for table_name in table_names:
+        table = db.table(table_name)
+        samples = _sorted_samples(table)
+        volatilities[table_name] = _sigma_per_hour(samples)
+    return volatilities
+
+
+def calculate_delta_percents(
+    db: tinydb.TinyDB, table_names: list[str]
+) -> dict[str, float | None]:
+    """Compute percent change between oldest and newest entries per period table."""
+    deltas: dict[str, float | None] = {}
+    for table_name in table_names:
+        table = db.table(table_name)
+        samples = _sorted_samples(table)
+        if len(samples) < 2:
+            deltas[table_name] = None
+            continue
+        _, oldest_rate = samples[0]
+        _, newest_rate = samples[-1]
+        deltas[table_name] = ((newest_rate - oldest_rate) / oldest_rate) * 100
+    return deltas
+
+
 def main() -> None:
     """Fetch, evaluate, and alert on GBP→EUR moves."""
-    try:
+    with tinydb.TinyDB(DATA_FILE.parent / "gbp_alert_db.json") as db:
         new_rate = get_current_rate(ENV.fx_url)
         logging.info("Fetched new rate: %s from %s", new_rate.rate, new_rate.source)
-    except (
-        requests.RequestException,
-        ValueError,
-        KeyError,
-        pydantic.ValidationError,
-    ) as err:
-        logging.error("ERROR fetching rate: %s", err)
-        return
-
-    last_rates = load_last_rates(DATA_FILE)
-
-    hourly_vol = calculate_hourly_volatility(last_rates)
-    if hourly_vol is None:
-        logging.warning("Rolling volatility unavailable; using static thresholds.")
-    else:
-        logging.info("Hourly vol estimate: %.4f%% (per sqrt hour)", hourly_vol)
-
-    diff_percents = calculate_delta_percents(new_rate, last_rates)
-
-    for delta, percent in diff_percents.items():
-        threshold = threshold_for_delta(delta, hourly_vol)
-        if abs(percent) >= threshold:
-            logging.info(
-                "ALERT condition met for %s: %.3f%% change (threshold: %.3f%%)",
-                delta,
-                percent,
-                threshold,
-            )
-            message = Message(new_rate=new_rate.rate, movement=percent)
-            send_telegram_message(message, ENV.bot_token, ENV.chat_id)
+        tables_updated = put_new_rate_into_db(
+            db, new_rate, force=True
+        )  # Set force=True for testing
+        if not tables_updated:
+            logging.info("No new entries added to any period table; exiting.")
+            return
+        volatilities = calculate_volatilities_per_period(db, tables_updated)
+        logging.info("Calculated volatilities per period: %s", volatilities)
+        deltas = calculate_delta_percents(db, tables_updated)
+        logging.info("Calculated delta percents per period: %s", deltas)
+        breaches = filter_tables_over_thresholds(deltas, volatilities)
+        logging.info("Tables exceeding thresholds: %s", breaches)
+        if breaches:
+            message = AlertMessage(breaches=breaches, volatilities=volatilities)
+            send_telegram_message(str(message), ENV.bot_token, ENV.chat_id)
             logging.info("Alert sent to Telegram.")
-
-    last_rates.append(new_rate)
-    last_rates = clean_rates(last_rates)
-    save_rates(DATA_FILE, last_rates)
 
 
 def setup_logging():
