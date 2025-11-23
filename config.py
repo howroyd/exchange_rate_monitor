@@ -1,4 +1,4 @@
-"""Configuration parsing and validation for GBP→EUR alerts."""
+"""Configuration parsing and validation for FX alerts."""
 
 import datetime
 import pathlib
@@ -46,6 +46,22 @@ class AlertPeriod(pydantic.BaseModel):
         return value
 
 
+class CurrencySettings(pydantic.BaseModel):
+    """Currency pair to monitor."""
+
+    base: str
+    quote: str
+
+    @pydantic.field_validator("base", "quote")
+    @classmethod
+    def validate_code(cls, value: str) -> str:
+        code = value.strip().upper()
+        if len(code) != 3 or not code.isalpha():
+            msg = "Currency codes must be 3-letter alphabetic strings."
+            raise ValueError(msg)
+        return code
+
+
 class AlertSettings(pydantic.BaseModel):
     """Alert thresholds and volatility parameters."""
 
@@ -65,6 +81,7 @@ class LoggingSettings(pydantic.BaseModel):
 class AppConfig(pydantic.BaseModel):
     """Application configuration loaded from TOML."""
 
+    currencies: CurrencySettings
     alerts: AlertSettings
     logging: LoggingSettings = LoggingSettings()
 
@@ -79,6 +96,8 @@ class RuntimeConfig:
     min_alert_threshold: float
     vol_multiplier: float
     vol_min_points: int
+    base_currency: str
+    quote_currency: str
 
 
 def load_app_config(config_path: pathlib.Path) -> AppConfig:
@@ -104,4 +123,6 @@ def build_runtime_config(app_config: AppConfig) -> RuntimeConfig:
         min_alert_threshold=app_config.alerts.min_alert_threshold,
         vol_multiplier=app_config.alerts.vol_multiplier,
         vol_min_points=app_config.alerts.vol_min_points,
+        base_currency=app_config.currencies.base,
+        quote_currency=app_config.currencies.quote,
     )

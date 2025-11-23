@@ -1,5 +1,5 @@
-#!.venv/bin python3
-"""GBP→EUR alerts with static and volatility-aware thresholds."""
+#!/usr/bin/env python3
+"""Daily FX alerts using the Frankfurter (ECB) API."""
 
 import datetime
 import itertools
@@ -7,33 +7,37 @@ import logging
 import math
 import pathlib
 import statistics
+import time
+from concurrent.futures import ProcessPoolExecutor
 from logging.handlers import RotatingFileHandler
-from typing import Any
+from typing import Any, Iterable
 
-import pydantic
 import pydantic_settings
 import requests
-import tinydb
+from rich.logging import RichHandler
 
 from config import RuntimeConfig, build_runtime_config, load_app_config
-from data import Datafile, put_new_rate_into_db, sorted_samples
 
-DEV_FORCE_INSERTION = True  # Set to True to always insert new rate for testing
+FRANKFURTER_API_BASE = "https://api.frankfurter.dev/v1"
+REQUEST_TIMEOUT_SECONDS = 15
+MAX_WAIT_SECONDS = 3600  # wait up to 1 hour for today's fix
+RETRY_SLEEP_SECONDS = 300  # retry every 5 minutes
+DEV_MODE = False  # default, can be overridden by .env
+
+CONFIG_FILE = pathlib.Path(__file__).parent / "config.toml"
+LOG_FILE = pathlib.Path(__file__).parent / "logs" / "gbp_alert.log"
 
 
 class Settings(pydantic_settings.BaseSettings):
-    """Environment configuration for Telegram and FX source."""
+    """Environment configuration for Telegram."""
 
     bot_token: str
     chat_id: int
-    fx_url: pydantic.HttpUrl
+    dev_mode: bool = False
 
 
 ENV = Settings(_env_file=".env")
-CONFIG_FILE = pathlib.Path(__file__).parent / "config.toml"
-DATA_FILE = pathlib.Path(__file__).parent / "data" / "gbp_last_rates.json"
-DB_FILE = DATA_FILE.parent / "gbp_alert_db.json"
-LOG_FILE = pathlib.Path(__file__).parent / "logs" / "gbp_alert.log"
+DEV_MODE = ENV.dev_mode
 
 
 # ---------------------------
@@ -43,9 +47,10 @@ def format_alert_message(
     breaches: dict[str, dict[str, float]],
     volatilities: dict[str, float | None],
     config: RuntimeConfig,
+    pair_label: str,
 ) -> str:
     """Render a human-readable alert summary."""
-    lines: list[str] = ["*GBP→EUR ALERTS*", ""]
+    lines: list[str] = [f"*{pair_label} ALERTS*", ""]
     for table_name, hits in sorted(breaches.items()):
         period = _period_from_table_name(table_name, config)
         if period is None or period not in config.alert_change_over_time:
@@ -72,12 +77,126 @@ def format_alert_message(
 # ---------------------------
 
 
-def get_current_rate(url: pydantic.HttpUrl) -> Datafile:
-    """Fetch the current GBP→EUR rate from the given API URL."""
-    response = requests.get(url, timeout=10)
+def fetch_latest_rate(base: str, quote: str) -> tuple[datetime.date, float]:
+    """Fetch the latest available rate for the currency pair."""
+    url = f"{FRANKFURTER_API_BASE}/latest"
+    response = requests.get(
+        url, params={"base": base, "symbols": quote}, timeout=REQUEST_TIMEOUT_SECONDS
+    )
     response.raise_for_status()
     data = response.json()
-    return Datafile(rate=float(data["rates"]["EUR"]), source=url)
+    date = datetime.date.fromisoformat(data["date"])
+    rate = float(data["rates"][quote])
+    return date, rate
+
+
+def fetch_timeseries(
+    base: str,
+    quote: str,
+    start_date: datetime.date,
+    end_date: datetime.date | None,
+) -> dict[datetime.date, float]:
+    """Fetch historical rates for the currency pair across the given period."""
+    end_segment = end_date.isoformat() if end_date else ""
+    url = f"{FRANKFURTER_API_BASE}/{start_date.isoformat()}..{end_segment}"
+    response = requests.get(
+        url, params={"base": base, "symbols": quote}, timeout=REQUEST_TIMEOUT_SECONDS
+    )
+    response.raise_for_status()
+    data = response.json()
+    return {
+        datetime.date.fromisoformat(date_str): float(rates[quote])
+        for date_str, rates in data["rates"].items()
+        if quote in rates
+    }
+
+
+def wait_for_fresh_rate(
+    base: str,
+    quote: str,
+    *,
+    dev_mode: bool = False,
+    max_wait_seconds: int = MAX_WAIT_SECONDS,
+    retry_sleep_seconds: int = RETRY_SLEEP_SECONDS,
+) -> tuple[datetime.date, float] | None:
+    """Poll until the latest date is today or until max_wait_seconds elapse."""
+    if dev_mode:
+        date, rate = fetch_latest_rate(base, quote)
+        logging.info(
+            "DEV_MODE enabled; accepting latest %s→%s: %s (%s) without waiting.",
+            base,
+            quote,
+            rate,
+            date,
+        )
+        return date, rate
+
+    deadline = datetime.datetime.now(datetime.UTC) + datetime.timedelta(
+        seconds=max_wait_seconds
+    )
+
+    while True:
+        fetch_started = datetime.datetime.now(datetime.UTC)
+        date, rate = fetch_latest_rate(base, quote)
+        logging.info("Fetched latest %s→%s: %s (%s)", base, quote, rate, date)
+
+        if date == datetime.date.today():
+            return date, rate
+
+        if fetch_started >= deadline:
+            logging.warning(
+                "Latest published date is still %s (not today); giving up after waiting.",
+                date,
+            )
+            return None
+
+        sleep_for = min(
+            retry_sleep_seconds,
+            int((deadline - fetch_started).total_seconds()),
+        )
+        logging.info(
+            "Latest date is %s (today is %s); waiting up to %s seconds before giving up.",
+            date,
+            datetime.date.today(),
+            int((deadline - fetch_started).total_seconds()),
+        )
+        logging.info(
+            "Latest date is %s (today is %s); retrying in %s seconds.",
+            date,
+            datetime.date.today(),
+            sleep_for,
+        )
+        time.sleep(max(1, sleep_for))
+
+
+def _history_samples(
+    history: dict[datetime.date, float],
+) -> list[tuple[datetime.datetime, float]]:
+    """Convert daily history into timestamped samples for volatility math."""
+    return sorted((_date_to_timestamp(date), rate) for date, rate in history.items())
+
+
+def _date_to_timestamp(date: datetime.date) -> datetime.datetime:
+    """Attach a deterministic time to a date (00:00 UTC)."""
+    return datetime.datetime.combine(date, datetime.time(0, 0, tzinfo=datetime.UTC))
+
+
+def _baseline_date(
+    dates: Iterable[datetime.date],
+    latest_date: datetime.date,
+    period: datetime.timedelta,
+) -> datetime.date | None:
+    """Pick the newest available date at or before the target window."""
+    sorted_dates = sorted(dates)
+    target_date = latest_date - period
+    candidates = [date for date in sorted_dates if date <= target_date]
+    if candidates:
+        return candidates[-1]
+
+    fallback = [date for date in sorted_dates if date < latest_date]
+    if fallback:
+        return fallback[-1]
+    return None
 
 
 def _sigma_per_hour(
@@ -102,7 +221,7 @@ def _sigma_per_hour(
 def _period_from_table_name(
     table_name: str, config: RuntimeConfig
 ) -> datetime.timedelta | None:
-    """Derive the timedelta represented by the TinyDB table name."""
+    """Derive the timedelta represented by the table name."""
     return config.table_periods.get(table_name)
 
 
@@ -177,72 +296,152 @@ def send_telegram_message(text: str, bot_token: str, chat_id: int) -> dict[str, 
         "text": text,
         "parse_mode": "Markdown",
     }
-    response = requests.post(url, json=payload, timeout=10)
+    response = requests.post(url, json=payload, timeout=REQUEST_TIMEOUT_SECONDS)
     response.raise_for_status()
     return response.json()
 
 
-def calculate_volatilities_per_period(
-    db: tinydb.TinyDB, table_names: list[str], config: RuntimeConfig
-) -> dict[str, float | None]:
-    """Calculate volatilities for each period table provided."""
-    return {
-        table_name: _sigma_per_hour(
-            sorted_samples(db.table(table_name)), config.vol_min_points
+def _start_date_for_history(
+    latest_date: datetime.date, config: RuntimeConfig
+) -> datetime.date:
+    """Choose a start date that covers the longest alert period plus weekend slack."""
+    max_period = max(config.alert_change_over_time.keys(), default=datetime.timedelta())
+    buffer_days = 3  # cover weekends/holidays
+    return latest_date - max_period - datetime.timedelta(days=buffer_days)
+
+
+def _period_metrics(
+    args: tuple[
+        datetime.timedelta,
+        str,
+        dict[datetime.date, float],
+        list[tuple[datetime.datetime, float]],
+        list[datetime.date],
+        datetime.date,
+        float,
+        int,
+    ],
+) -> tuple[str, float | None, float | None]:
+    """Compute volatility and delta for a single period (for parallel execution)."""
+    (
+        period,
+        table_name,
+        history,
+        samples,
+        sorted_dates,
+        latest_date,
+        latest_rate,
+        vol_min_points,
+    ) = args
+
+    latest_ts = _date_to_timestamp(latest_date)
+    cutoff = latest_ts - period
+    window_samples = [s for s in samples if cutoff <= s[0] <= latest_ts]
+    volatility = _sigma_per_hour(window_samples, vol_min_points)
+
+    baseline_date = _baseline_date(sorted_dates, latest_date, period)
+    delta_percent: float | None = None
+    if baseline_date is not None:
+        baseline_rate = history.get(baseline_date)
+        if baseline_rate not in (None, 0):
+            delta_percent = ((latest_rate - baseline_rate) / baseline_rate) * 100
+
+    return table_name, volatility, delta_percent
+
+
+def compute_metrics_parallel(
+    history: dict[datetime.date, float],
+    latest_date: datetime.date,
+    latest_rate: float,
+    config: RuntimeConfig,
+    executor: ProcessPoolExecutor,
+) -> tuple[dict[str, float | None], dict[str, float | None]]:
+    """Calculate volatilities and deltas concurrently across all periods."""
+    samples = _history_samples(history)
+    sorted_dates = sorted(history.keys())
+    tasks = (
+        (
+            period,
+            table_name,
+            history,
+            samples,
+            sorted_dates,
+            latest_date,
+            latest_rate,
+            config.vol_min_points,
         )
-        for table_name in table_names
-    }
+        for period, table_name in config.table_names.items()
+    )
 
-
-def calculate_delta_percents(
-    db: tinydb.TinyDB, table_names: list[str]
-) -> dict[str, float | None]:
-    """Compute percent change between oldest and newest entries per period table."""
+    volatilities: dict[str, float | None] = {}
     deltas: dict[str, float | None] = {}
-    for table_name in table_names:
-        samples = sorted_samples(db.table(table_name))
-        if len(samples) < 2:
-            deltas[table_name] = None
-            continue
-        _, oldest_rate = samples[0]
-        _, newest_rate = samples[-1]
-        deltas[table_name] = ((newest_rate - oldest_rate) / oldest_rate) * 100
-    return deltas
+    for table_name, volatility, delta_percent in executor.map(_period_metrics, tasks):
+        volatilities[table_name] = volatility
+        deltas[table_name] = delta_percent
+    return volatilities, deltas
 
 
 def main() -> None:
-    """Fetch, evaluate, and alert on GBP→EUR moves."""
+    """Fetch, evaluate, and alert on FX moves."""
     app_config = load_app_config(CONFIG_FILE)
     runtime_config = build_runtime_config(app_config)
 
-    data_dir = DATA_FILE.parent
     log_dir = LOG_FILE.parent
-    data_dir.mkdir(parents=True, exist_ok=True)
     log_dir.mkdir(parents=True, exist_ok=True)
 
     setup_logging(LOG_FILE, app_config.logging.max_bytes, app_config.logging.backups)
 
-    with tinydb.TinyDB(DB_FILE) as db:
-        new_rate = get_current_rate(ENV.fx_url)
-        logging.info("Fetched new rate: %s from %s", new_rate.rate, new_rate.source)
-        tables_updated = put_new_rate_into_db(
-            db, new_rate, runtime_config, force=DEV_FORCE_INSERTION
+    base = runtime_config.base_currency
+    quote = runtime_config.quote_currency
+    pair_label = f"{base}→{quote}"
+    logging.info("Starting %s alert run.", pair_label)
+
+    if not DEV_MODE and datetime.date.today().weekday() >= 5:
+        logging.warning(
+            "Today is a weekend; ECB does not publish rates. Exiting early."
         )
-        if not tables_updated:
-            logging.info("No new entries added to any period table; exiting.")
+        return
+
+    with ProcessPoolExecutor() as executor:
+        latest = executor.submit(
+            wait_for_fresh_rate, base, quote, dev_mode=DEV_MODE
+        ).result()
+        if latest is None:
+            logging.warning(
+                "Exiting without alerts because today's rate was not published."
+            )
             return
-        volatilities = calculate_volatilities_per_period(
-            db, tables_updated, runtime_config
+        latest_date, latest_rate = latest
+
+        start_date = _start_date_for_history(latest_date, runtime_config)
+        history = fetch_timeseries(base, quote, start_date, latest_date)
+        if not history:
+            logging.warning(
+                "No historical data returned from Frankfurter; using only the latest rate."
+            )
+        history[latest_date] = latest_rate  # ensure latest sample is present
+        logging.info(
+            "Loaded %s data points from %s to %s.",
+            len(history),
+            min(history).isoformat(),
+            max(history).isoformat(),
+        )
+
+        volatilities, deltas = compute_metrics_parallel(
+            history, latest_date, latest_rate, runtime_config, executor
         )
         logging.info("Calculated volatilities per period: %s", volatilities)
-        deltas = calculate_delta_percents(db, tables_updated)
         logging.info("Calculated delta percents per period: %s", deltas)
         breaches = filter_tables_over_thresholds(deltas, volatilities, runtime_config)
         logging.info("Tables exceeding thresholds: %s", breaches)
         if breaches:
-            message_text = format_alert_message(breaches, volatilities, runtime_config)
+            message_text = format_alert_message(
+                breaches, volatilities, runtime_config, pair_label
+            )
             send_telegram_message(message_text, ENV.bot_token, ENV.chat_id)
             logging.info("Alert sent to Telegram.")
+        else:
+            logging.info("No alerts triggered.")
 
 
 def setup_logging(log_file: pathlib.Path, max_bytes: int, backups: int):
@@ -252,9 +451,17 @@ def setup_logging(log_file: pathlib.Path, max_bytes: int, backups: int):
         log_file, maxBytes=max_bytes, backupCount=backups
     )
     file_handler.setFormatter(formatter)
-    stream_handler = logging.StreamHandler()
-    stream_handler.setFormatter(formatter)
-    logging.basicConfig(level=logging.INFO, handlers=[file_handler, stream_handler])
+    rich_handler = RichHandler(
+        markup=False,
+        rich_tracebacks=False,
+        show_time=True,
+        log_time_format="[%Y-%m-%d %H:%M:%S]",
+    )
+    logging.basicConfig(
+        level=logging.INFO,
+        handlers=[file_handler, rich_handler],
+        format="%(message)s",
+    )
 
 
 if __name__ == "__main__":

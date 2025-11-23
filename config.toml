@@ -1,19 +1,19 @@
+[currencies]
+base = "GBP"
+quote = "EUR"
+
 [alerts]
 min_alert_threshold = 0.1
 vol_multiplier = 1.75
 vol_min_points = 6
 
 [[alerts.periods]]
-period = "1h"
-threshold = 0.2
-
-[[alerts.periods]]
-period = "6h"
-threshold = 0.5
-
-[[alerts.periods]]
 period = "1d"
-threshold = 1.0
+threshold = 0.75
+
+[[alerts.periods]]
+period = "3d"
+threshold = 1.5
 
 [[alerts.periods]]
 period = "7d"
@@ -26,6 +26,10 @@ threshold = 3.5
 [[alerts.periods]]
 period = "30d"
 threshold = 5.0
+
+[[alerts.periods]]
+period = "90d"
+threshold = 7.5
 
 [logging]
 max_bytes = 1000000
